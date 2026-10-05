@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.venv/
+venv/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Evaluation outputs and large media/checkpoints
+artifacts/
+outputs/
+reports/
+logs/
+videos/
+*.mp4
+*.pt
+*.pth
+*.npz
