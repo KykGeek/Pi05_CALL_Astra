@@ -6,17 +6,13 @@ from pathlib import Path
 from typing import Any
 
 
-OFFICIAL_PI05_LIBERO_CHECKPOINT_PATH = (
-    "/root/LIBERO_Recovery_Benchmark/openpi_cache/"
-    "openpi-assets/checkpoints/pi05_libero"
-)
+OFFICIAL_PI05_LIBERO_CHECKPOINT_NAME = "pi05_libero"
 OFFICIAL_PI05_LIBERO_SOURCE_URI = "gs://openpi-assets/checkpoints/pi05_libero"
 OFFICIAL_PI05_LIBERO_CONFIG = "pi05_libero"
 
 
 def is_official_pi05_libero_path(path: str | Path) -> bool:
-    normalized = str(path).replace("\\", "/").rstrip("/")
-    return normalized == OFFICIAL_PI05_LIBERO_CHECKPOINT_PATH
+    return Path(path).expanduser().name == OFFICIAL_PI05_LIBERO_CHECKPOINT_NAME
 
 
 def validate_official_pi05_libero_checkpoint(
@@ -24,15 +20,15 @@ def validate_official_pi05_libero_checkpoint(
     *,
     require_exists: bool = True,
 ) -> Path:
-    """Require the exact A100 cache location whose official source was audited."""
+    """Validate a user-supplied location for the compatible LIBERO checkpoint."""
     if not is_official_pi05_libero_path(path):
         raise ValueError(
-            "CALL_ASTRA V1 requires the verified OpenPI pi05_libero checkpoint at "
-            f"{OFFICIAL_PI05_LIBERO_CHECKPOINT_PATH}; received {path}"
+            "CALL_ASTRA V1 expects the compatible OpenPI LIBERO checkpoint directory "
+            f"to be named {OFFICIAL_PI05_LIBERO_CHECKPOINT_NAME!r}; received {path}"
         )
     resolved = Path(path).expanduser()
     if require_exists and not resolved.is_dir():
-        raise FileNotFoundError(f"official pi05_libero checkpoint is missing: {resolved}")
+        raise FileNotFoundError(f"pi05_libero checkpoint is missing: {resolved}")
     return resolved.resolve()
 
 

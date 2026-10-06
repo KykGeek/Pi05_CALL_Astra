@@ -43,7 +43,9 @@ from .geometry import quat_wxyz_to_matrix
 def _developer_instructions() -> str:
     """Load the versioned English Developer prompt used by Astra."""
     candidates = (
-        Path(__file__).resolve().parents[2] / "docs" / "prompts" / "call_llm_recovery_instructions.md",
+        Path(__file__).resolve().with_name("ASTRA_PI05_RECOVERY_PROMPT_EN.md"),
+        Path(__file__).resolve().parents[2] / "ASTRA_PI05_RECOVERY_PROMPT_EN.md",
+        Path.cwd() / "ASTRA_PI05_RECOVERY_PROMPT_EN.md",
     )
     for prompt_path in candidates:
         try:
@@ -326,9 +328,6 @@ class RecoveryOrchestrator:
                 ],
                 "max_wall_seconds": self.max_wall_seconds,
             }
-            # All supported Astra model variants use the same Codex app-server
-            # Responses transport and the same tool/state-machine loop. The
-            # model name is the only model-specific runtime choice.
             initial_context = self._refresh_host_context()
             transient_retry_count = 0
             context = initial_context
@@ -700,9 +699,7 @@ class RecoveryOrchestrator:
         # Keep the camera frames on the private turn packet as real image
         # inputs.  They must not be placed in latest_context.json or in the
         # text context, but _content_items() needs them to build the next
-        # Responses turn.  Previously _images was popped above and never
-        # restored, so Astra received only observation file paths and zero
-        # image items.
+        # Responses turn.
         if images:
             compact["_images"] = images
         return compact
@@ -726,7 +723,7 @@ class RecoveryOrchestrator:
                     "summary": transport_summary,
                 })
             except Exception:
-                # Cleanup must still stop both Codex and the relay.
+                # Cleanup must still stop both the client and the relay.
                 pass
         try:
             client.close()

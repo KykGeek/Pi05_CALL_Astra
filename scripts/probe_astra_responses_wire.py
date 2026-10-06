@@ -5,16 +5,18 @@ import argparse
 import json
 import os
 import re
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import requests
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from call_llm.runtime.executor import _developer_instructions
-from call_llm.runtime.protocol import tool_specs
+from models.astra.executor import _developer_instructions
+from models.astra.protocol import tool_specs
+from models.astra.codex_client import _valid_provider_url
 
 
 def _safe(value):
@@ -27,14 +29,21 @@ def _safe(value):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="gpt-6-luna")
+    parser.add_argument("--model", default=os.environ.get("ASTRA_MODEL", "gpt-6-astra"))
     parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default="medium")
     parser.add_argument("--timeout", type=float, default=90.0)
     args = parser.parse_args()
-    api_key = os.environ.get("API_SECRET_KEY", "").strip()
-    base_url = os.environ.get("BASE_URL", "https://api.zhizengzeng.com/v1").rstrip("/")
+    api_key_env = os.environ.get("ASTRA_API_KEY_ENV", "ASTRA_API_KEY").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
+        raise SystemExit("ASTRA_API_KEY_ENV must be a valid environment-variable name")
+    api_key = os.environ.get(api_key_env, "").strip()
+    base_url = os.environ.get("ASTRA_BASE_URL", "").rstrip("/")
     if not api_key:
-        raise SystemExit("API_SECRET_KEY is required")
+        raise SystemExit(f"set a provider key in the environment variable named by ASTRA_API_KEY_ENV ({api_key_env})")
+    if not base_url:
+        raise SystemExit("ASTRA_BASE_URL is required")
+    if not _valid_provider_url(base_url):
+        raise SystemExit("ASTRA_BASE_URL must be an HTTPS /v1 endpoint")
 
     tools = [
         {

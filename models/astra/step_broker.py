@@ -34,13 +34,8 @@ class StepBroker:
         self.history = history
         self.pi05_action_validator = pi05_action_validator
         self.astra_action_validator = astra_action_validator
-        self.frame_sink = None
         self.env_steps = self.phase_pi05_steps = 0
-        self.pi05_total_steps = 0
-        # Host-side count of actions executed by the recovery model.  The
-        # legacy astra_total_steps property below remains as a compatibility
-        # alias because old reports already use that field name.
-        self.recovery_model_total_steps = 0
+        self.pi05_total_steps = self.astra_total_steps = 0
         self.owner = 'pi05'
         self.uncertain = False
         self.task_succeeded = False
@@ -79,12 +74,10 @@ class StepBroker:
             self.owner, self.stop_reason = 'stopped', str(reason)
 
     def begin_pi05_phase(self):
-        """Resume pi05 ownership without restarting its episode budget."""
         with self._lock:
             if self.owner != 'astra' or self.uncertain:
                 raise RuntimeError('phase_reset_without_handoff')
-            # Keep the cumulative pi05 step count.  A handback must not grant
-            # pi05 another max-step window in the same episode.
+            self.phase_pi05_steps = 0
 
     def step(self, action, *, source, decision_id=None):
         with self._lock:
@@ -126,20 +119,12 @@ class StepBroker:
                 self.pi05_total_steps += 1
                 self.phase_pi05_steps += 1
             else:
-                self.recovery_model_total_steps += 1
+                self.astra_total_steps += 1
             try:
                 self._checkpoint = self._capture(raw)
                 self._registry[self._checkpoint.checkpoint_id] = self._checkpoint
                 self.task_succeeded = bool(self._env.check_success())
                 self.environment_ended = bool(done)
-                if self.frame_sink is not None:
-                    try:
-                        self.frame_sink(self._checkpoint.raw, self.env_steps, source)
-                    except Exception as video_error:
-                        self.journal.append(dict(
-                            event='video_frame_error', env_step=self.env_steps,
-                            error=type(video_error).__name__,
-                        ))
                 self.journal.append(dict(event='step_finished', attempt_id=attempt_id,
                     source=source, decision_id=decision_id, env_step=self.env_steps,
                     observation_id=self._checkpoint.observation_id,
@@ -152,8 +137,3 @@ class StepBroker:
                 raise
             return StepResult(copy.deepcopy(self._checkpoint), self.task_succeeded,
                               self.environment_ended)
-
-    @property
-    def astra_total_steps(self):
-        """Deprecated compatibility alias; Astra is the model name."""
-        return self.recovery_model_total_steps

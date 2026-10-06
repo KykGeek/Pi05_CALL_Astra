@@ -28,24 +28,30 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parents[1]
-EXPERIMENT_ROOT = PROJECT_ROOT
-DEFAULT_CHECKPOINT = Path(os.environ["PI05_CHECKPOINT"]) if os.environ.get("PI05_CHECKPOINT") else None
-DEFAULT_OPENPI_ROOT = Path(os.environ["OPENPI_ROOT"]) if os.environ.get("OPENPI_ROOT") else None
+EXPERIMENT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "scripts" else SCRIPT_DIR
+PROJECT_ROOT = EXPERIMENT_ROOT.parent
+DEFAULT_CHECKPOINT = (
+    Path(os.environ["PI05_CHECKPOINT"]).expanduser()
+    if os.environ.get("PI05_CHECKPOINT") else None
+)
+DEFAULT_OPENPI_ROOT = (
+    Path(os.environ["OPENPI_ROOT"]).expanduser()
+    if os.environ.get("OPENPI_ROOT") else None
+)
 
 for _path in (PROJECT_ROOT, EXPERIMENT_ROOT, SCRIPT_DIR, PROJECT_ROOT / "scripts"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from call_llm.action_statistics import action_statistics  # noqa: E402
-from call_llm.call_controller import CallController, ControllerState  # noqa: E402
-from call_llm.decision import (  # noqa: E402
+from models.action_statistics import action_statistics  # noqa: E402
+from models.call_controller import CallController, ControllerState  # noqa: E402
+from models.decision import (  # noqa: E402
     BudgetDecisionEngine,
     CallDecisionEngine,
     DecisionEngine,
     OracleCompetenceDecisionEngine,
 )
-from call_llm.handoff import HandoffHandler, LoggingHandoffHandler  # noqa: E402
+from models.handoff import HandoffHandler, LoggingHandoffHandler  # noqa: E402
 
 
 def _json_safe(value: Any) -> Any:
@@ -235,7 +241,7 @@ def state_statistics_from_policy_result(policy_result: Mapping[str, Any]) -> np.
 def feature_vector_from_policy_result(
     policy_result: Mapping[str, Any], feature_set: str
 ) -> np.ndarray:
-    from call_llm.call_assist_head import FEATURE_SET_DIMS
+    from models.call_astra_v1_head import FEATURE_SET_DIMS
 
     if "features" not in policy_result:
         raise KeyError("π0.5 feature path did not return hidden features")
@@ -403,14 +409,14 @@ def _build_astra_runtime(
     runtime_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Create one isolated recovery runtime around this already-reset LIBERO env."""
-    from call_llm.runtime.adapter import LiberoEefAdapter
-    from call_llm.runtime.codex_client import DEFAULT_ASTRA_MODEL, DEFAULT_REASONING_EFFORT
-    from call_llm.runtime.executor import RecoveryOrchestrator
-    from call_llm.runtime.handoff import ExclusiveAstraHandoffHandler
-    from call_llm.runtime.history import PublicEefHistory
-    from call_llm.runtime.journal import Journal
-    from call_llm.runtime.proposal import Pi05ProposalService
-    from call_llm.runtime.step_broker import StepBroker
+    from models.astra.adapter import LiberoEefAdapter
+    from models.astra.codex_client import DEFAULT_ASTRA_MODEL, DEFAULT_REASONING_EFFORT
+    from models.astra.executor import RecoveryOrchestrator
+    from models.astra.handoff import ExclusiveAstraHandoffHandler
+    from models.astra.history import PublicEefHistory
+    from models.astra.journal import Journal
+    from models.astra.proposal import Pi05ProposalService
+    from models.astra.step_broker import StepBroker
 
     root = Path(runtime_config["runtime_root"]).expanduser().resolve()
     if root.exists():
@@ -801,12 +807,14 @@ def run_closed_loop_episode(
                         resume_decision = controller.resume_after_recovery()
                         observation = recovery.resume_observation
                         env_steps = int(resume_decision.resume_step)
-                        phase_env_steps = int(resume_decision.resume_step)
+                        phase_env_steps = 0
                     action_queue.clear()
                     recovery_events.append(
                         {
                             "status": recovery.status,
                             "detail": recovery.detail,
+                            "astra_called": bool(recovery.astra_called),
+                            "recovery_executed": bool(recovery.recovery_executed),
                             "intervention_start_step": int(
                                 recovery.intervention_start_step
                             ),
@@ -949,6 +957,9 @@ def run_closed_loop_episode(
                         "cooldown_suppressed": bool(
                             getattr(decision, "cooldown_suppressed", False)
                         ),
+                        "min_steps_suppressed": bool(
+                            getattr(decision, "min_steps_suppressed", False)
+                        ),
                         "progress_source": progress_source,
                         "progress_delta": progress_delta,
                         "previous_progress_source": previous_progress_source,
@@ -1017,12 +1028,14 @@ def run_closed_loop_episode(
                             resume_decision = controller.resume_after_recovery()
                             observation = recovery.resume_observation
                             env_steps = int(resume_decision.resume_step)
-                            phase_env_steps = int(resume_decision.resume_step)
+                            phase_env_steps = 0
                         action_queue.clear()
                         recovery_events.append(
                             {
                                 "status": recovery.status,
                                 "detail": recovery.detail,
+                                "astra_called": bool(recovery.astra_called),
+                                "recovery_executed": bool(recovery.recovery_executed),
                                 "intervention_start_step": int(
                                     recovery.intervention_start_step
                                 ),
@@ -1310,22 +1323,18 @@ def run_closed_loop_episode(
             handoff_response is not None
             and handoff_response.recovery is not None
             and handoff_response.recovery.astra_called
-        ) or bool(recovery_events),
+        ) or any(bool(event.get("astra_called")) for event in recovery_events),
         "recovery_executed": bool(
             handoff_response is not None
             and handoff_response.recovery is not None
             and handoff_response.recovery.recovery_executed
-        ) or any(
-            str(event.get("status")) == "completed"
-            for event in recovery_events
-            if isinstance(event, Mapping)
-        ),
+        ) or any(bool(event.get("recovery_executed")) for event in recovery_events),
         # Legacy report key: Astra is the selected recovery model name.
         "astra_called": bool(
             handoff_response is not None
             and handoff_response.recovery is not None
             and handoff_response.recovery.astra_called
-        ) or bool(recovery_events),
+        ) or any(bool(event.get("astra_called")) for event in recovery_events),
         "max_steps": int(max_steps),
         "replan_steps": int(replan_steps),
         "elapsed_seconds": time.monotonic() - started,
@@ -1457,9 +1466,9 @@ def load_task_heads(
 ) -> dict[str, LoadedAssistHead]:
     import torch
 
-    from call_llm.call_assist_head import build_call_assist_mlp
+    from models.call_astra_v1_head import build_call_assist_mlp
 
-    from call_llm.checkpoint_provenance import (
+    from models.checkpoint_provenance import (
         OFFICIAL_PI05_LIBERO_CONFIG,
         OFFICIAL_PI05_LIBERO_SOURCE_URI,
     )
@@ -1891,7 +1900,7 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--replan-steps", type=int, default=5)
     parser.add_argument("--camera-size", type=int, default=256)
     parser.add_argument("--reset-retries", type=int, default=12)
-    parser.add_argument("--gpu-index", type=int, default=1)
+    parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--gpu-max-memory-mib", type=int, default=2048)
     parser.add_argument("--gpu-max-utilization", type=int, default=5)
     parser.add_argument("--threshold-point", choices=("conservative", "balanced", "aggressive"), default="balanced")
@@ -1935,7 +1944,7 @@ def _make_parser() -> argparse.ArgumentParser:
         help="optional alternative: let Astra return and execute a 30-50 action EEF chunk",
     )
     parser.add_argument("--astra-smoke-force-call", action="store_true", help="diagnostic only: force one CALL after π0.5 has executed its first action segment; requires exactly one task and one episode")
-    parser.add_argument("--astra-model", default=os.environ.get("ASTRA_MODEL", "gpt-6-luna"))
+    parser.add_argument("--astra-model", default=os.environ.get("ASTRA_MODEL", "gpt-6-astra"))
     parser.add_argument(
         "--astra-reasoning-effort",
         choices=("low", "medium", "high", "xhigh", "max"),
@@ -1951,10 +1960,6 @@ def _make_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _make_parser().parse_args(argv)
-    if args.checkpoint is None:
-        raise SystemExit("set PI05_CHECKPOINT or pass --checkpoint")
-    if args.openpi_root is None:
-        raise SystemExit("set OPENPI_ROOT or pass --openpi-root")
     if (args.episodes_per_task <= 0 or args.max_steps <= 0 or
             args.episode_horizon <= 0 or args.replan_steps <= 0):
         raise SystemExit(
@@ -2019,6 +2024,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("gpu-index must be nonnegative")
     if args.replan_steps > 10:
         raise SystemExit("replan-steps cannot exceed the π0.5 ten-action chunk")
+    if args.openpi_root is None:
+        raise SystemExit("set --openpi-root or OPENPI_ROOT to the external OpenPI checkout")
+    if args.checkpoint is None:
+        raise SystemExit("set --checkpoint or PI05_CHECKPOINT to the external pi05_libero checkpoint")
+    args.openpi_root = args.openpi_root.expanduser().resolve()
+    args.checkpoint = args.checkpoint.expanduser().resolve()
+    if not args.openpi_root.is_dir():
+        raise SystemExit(f"OpenPI checkout not found: {args.openpi_root}")
     try:
         gpu_memory, gpu_utilization = assert_gpu_idle(
             args.gpu_index,
@@ -2028,7 +2041,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"GPU preflight refused inference: {exc}") from exc
 
-    from call_llm.checkpoint_provenance import (
+    from models.checkpoint_provenance import (
         official_pi05_libero_metadata,
         validate_official_pi05_libero_checkpoint,
     )
@@ -2125,7 +2138,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from scripts.libero_compat import patch_torch_load_for_libero
 
     patch_torch_load_for_libero()
-    from call_llm.feature_policy import Pi05FeaturePolicy
+    from models.feature_policy import Pi05FeaturePolicy
     import jax
 
     tasks = _task_specs(

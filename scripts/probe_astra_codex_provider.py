@@ -1,29 +1,37 @@
-"""No-robot diagnostic for the Codex app-server provider and tool-call path."""
+"""No-robot diagnostic for the provider and tool-call path."""
 from __future__ import annotations
 
 import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import struct
+import sys
 import subprocess
 import tempfile
 import zlib
 from pathlib import Path
-import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from call_llm.runtime.codex_client import CodexAppServerClient, CodexClientError
+from models.astra.codex_client import (
+    CodexAppServerClient,
+    CodexClientError,
+    _valid_provider_url,
+)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("text", "tool", "exec"), default="tool")
-    parser.add_argument("--provider-variant", choices=("custom", "openai"), default="custom")
-    parser.add_argument("--model", default="gpt-6-luna")
+    parser.add_argument("--provider", default=os.environ.get("ASTRA_CODEX_PROVIDER", "custom"))
+    parser.add_argument("--base-url", default=os.environ.get("ASTRA_BASE_URL", ""))
+    parser.add_argument("--api-key-env", default=os.environ.get("ASTRA_API_KEY_ENV", "ASTRA_API_KEY"))
+    parser.add_argument("--model", default=os.environ.get("ASTRA_MODEL", "gpt-6-astra"))
     parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default="medium")
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--relay", action="store_true",
@@ -31,24 +39,30 @@ def main() -> int:
     parser.add_argument("--with-images", action="store_true",
                         help="Exercise two synthetic RGB attachments in the no-robot tool loop")
     args = parser.parse_args()
-    base_url = os.environ.get("BASE_URL", "https://api.zhizengzeng.com/v1").rstrip("/")
+    base_url = str(args.base_url).rstrip("/")
+    if not base_url:
+        parser.error("set ASTRA_BASE_URL or pass --base-url")
+    if not _valid_provider_url(base_url):
+        parser.error("provider URL must be an HTTPS /v1 endpoint")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", str(args.provider)):
+        parser.error("provider name may contain only letters, numbers, '_' and '-'")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(args.api_key_env)):
+        parser.error("API-key environment-variable name is invalid")
 
     if args.mode == "exec":
         executable = shutil.which("codex")
         if executable is None:
             print(json.dumps({"probe": "failed", "mode": "exec", "error_code": "codex_cli_not_found"}))
             return 1
-        provider_id = "zhizengzeng" if args.provider_variant == "custom" else "openai"
-        auth_env = "API_SECRET_KEY" if provider_id == "zhizengzeng" else "OPENAI_API_KEY"
+        provider_id = str(args.provider)
+        auth_env = str(args.api_key_env)
         config = [
             'model_provider="' + provider_id + '"',
             "model_providers." + provider_id + ".name=" + json.dumps(provider_id),
             "model_providers." + provider_id + ".base_url=" + json.dumps(base_url),
             "model_providers." + provider_id + '.wire_api="responses"',
             "model_providers." + provider_id + ".env_key=" + json.dumps(auth_env),
-            "model_providers." + provider_id + ".requires_openai_auth=" + (
-                "false" if provider_id == "zhizengzeng" else "true"
-            ),
+            "model_providers." + provider_id + ".requires_openai_auth=false",
             'model_reasoning_effort="' + args.effort + '"',
             "features.multi_agent_v2.enabled=false",
         ]
@@ -61,8 +75,6 @@ def main() -> int:
                 command.extend(("-c", value))
             command.extend(("--model", args.model, "Reply with the single word OK."))
             child_env = os.environ.copy()
-            if provider_id == "openai":
-                child_env["OPENAI_API_KEY"] = child_env.get("API_SECRET_KEY", "")
             try:
                 completed = subprocess.run(
                     command, cwd=workspace, env=child_env, text=True,
@@ -72,7 +84,7 @@ def main() -> int:
                 result = {
                     "probe": "passed" if completed.returncode == 0 else "failed",
                     "mode": "exec",
-                    "provider_variant": args.provider_variant,
+                    "provider_configured": True,
                     "exit_code": int(completed.returncode),
                     "ok_response_present": "OK" in completed.stdout,
                     "response_stream_disconnected": (

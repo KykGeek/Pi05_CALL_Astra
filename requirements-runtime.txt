@@ -1,0 +1,6 @@
+# Install inside the compatible external OpenPI environment.
+# OpenPI/JAX/CUDA/MuJoCo/PyTorch are intentionally managed outside this file.
+requests>=2.28,<3
+scipy>=1.9,<2
+opencv-python-headless>=4.7
+pyarrow>=10

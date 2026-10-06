@@ -1,61 +1,85 @@
-# CALL LLM + Pi0.5 for LIBERO
+# π0.5 + CALL + Astra for LIBERO
 
-This repository contains an experimental CALL LLM evaluation runner and recovery integration for Pi0.5-controlled LIBERO episodes. Astra is the configured model; `call_llm/` names the host-side language-model control and API integration. This is research code, not a standalone simulator or a packaged policy checkpoint.
+Research runtime for a LIBERO episode controlled by π0.5, with a learned CALL head and an optional Astra recovery controller. The runtime includes the verified handoff/re-entry gate, the LIBERO EEF adapter, bounded Astra execution, and episode logging.
 
-## Repository map
+## Scope
 
-| Path | Purpose |
-| --- | --- |
-| `call_llm/` | CALL decision logic, feature helpers, and language-model-assisted recovery. |
-| `call_llm/runtime/` | Responses client, tool protocol, EEF adapter, execution journal, and step ownership. |
-| `scripts/benchmark/run_libero_call_llm_benchmark.py` | Main task/episode benchmark runner. |
-| `scripts/benchmark/run_shadow_suite_pipeline.sh` | Optional multi-suite shadow-evaluation pipeline. |
-| `scripts/diagnostics/` | Provider/tool-schema probes and LIBERO action-protocol audit. |
-| `docs/prompts/call_llm_recovery_instructions.md` | Developer instructions supplied to the model. |
-| `history/` | Archived reference material; not imported by the runtime. |
-| `requirements.txt` | Python package dependencies used by the code in this repository. |
+This repository contains integration code, not model weights or a complete robotics distribution. OpenPI, LIBERO/robosuite, the π0.5 checkpoint, trained CALL heads, and provider credentials are external by design. Configure their locations and credentials on the evaluation host; do not add them to Git.
 
-## Requirements
+The live controller uses public images and robot observations for CALL/Astra inputs. Simulator-private object state is not used as a policy feature. Private simulator snapshots may be retained locally for audit; generated snapshots and experiment results are excluded from this source package.
 
-The full benchmark must run on a Linux host configured for the matching OpenPI, Pi0.5, LIBERO, robosuite, and GPU stack. This repository does not include the simulator, datasets, model checkpoint, or OpenPI source checkout. Install OpenPI and its robotics dependencies using their own instructions; their JAX/PyTorch and CUDA versions must be compatible with the selected GPU and checkpoint.
+## External runtime inputs
 
-Install this repository's Python dependencies from the project root:
+Prepare a compatible Linux/GPU environment that already has the OpenPI checkout and its LIBERO dependencies. This project deliberately does not install or pin OpenPI, JAX, CUDA, MuJoCo, or the π0.5 weights.
 
-```bash
-python -m pip install -r requirements.txt
-```
+The runner accepts these external paths:
 
-The requirements file lists package names without version pins because the correct JAX, PyTorch, and CUDA builds depend on the external OpenPI environment. For reproducible experiments, record the exact environment versions used on the evaluation host.
+- `OPENPI_ROOT`: OpenPI checkout, including its `third_party/libero` tree.
+- `PI05_CHECKPOINT`: compatible LIBERO π0.5 checkpoint directory; its directory name must be `pi05_libero`.
+- `--model-dir`: trained CALL-head directory. For the learned baseline it must contain the expected `fold_models/fold_*.pt` checkpoints and checkpoint metadata.
 
-You also need:
+The Astra transport is provider-configurable. Set these in the process environment or a secret manager, never in a tracked file:
 
-- An OpenPI checkout and a compatible Pi0.5 LIBERO checkpoint.
-- The LIBERO benchmark assets and a working robosuite/MuJoCo rendering setup.
-- The Codex app-server executable available to the runtime for model-assisted recovery.
-- Provider credentials configured in the host environment. Never commit API keys or `.env` files.
+- `ASTRA_CODEX_PROVIDER`: provider identifier used by Codex CLI.
+- `ASTRA_BASE_URL`: provider Responses API base URL, ending in `/v1`.
+- `ASTRA_API_KEY_ENV`: name of the environment variable holding the secret; defaults to `ASTRA_API_KEY`.
+- `ASTRA_MODEL`: model identifier; defaults to `gpt-6-astra`.
+- `ASTRA_REASONING_EFFORT`: reasoning effort; defaults to `medium`.
 
-## Configure and run
+The `codex` CLI must be installed and available on `PATH`. The API key itself is read from the environment variable named by `ASTRA_API_KEY_ENV`; it is never written into the repository. Do not commit `.env` files. If a credential was ever committed, rotate it rather than relying on deleting the file.
 
-Set the external OpenPI and checkpoint paths, then inspect the runner options:
+## Install and verify
+
+Run these commands inside the already-compatible OpenPI environment. They install only this integration's small runtime additions, not OpenPI or its GPU stack:
 
 ```bash
-export OPENPI_ROOT=/path/to/openpi
-export PI05_CHECKPOINT=/path/to/pi05_libero_checkpoint
-python scripts/benchmark/run_libero_call_llm_benchmark.py --help
+python -m pip install -r requirements-runtime.txt
+python scripts/run_call_astra_v1_closed_loop.py --help
 ```
 
-Use the runner's `--suite`, `--episodes-per-task`, `--output-dir`, and GPU options to choose an evaluation. Review `--help` on the target host before launching: the runner controls a simulator and may call an external model API.
+Verify the live runtime with a one-episode simulator smoke test on the target host after configuring the external assets and provider credentials.
 
-For the optional four-suite shadow pipeline, configure `MODEL_ROOT` to point to trained CALL LLM decision heads, then run:
+## One-episode live smoke test
+
+After configuring the external assets and provider credentials, select one task and a new output directory. The forced-call switch is diagnostic only: it deliberately requests one Astra intervention and should not be used for formal evaluation.
 
 ```bash
-bash scripts/benchmark/run_shadow_suite_pipeline.sh
+python scripts/run_call_astra_v1_closed_loop.py \
+  --openpi-root "$OPENPI_ROOT" \
+  --checkpoint "$PI05_CHECKPOINT" \
+  --model-dir "$CALL_MODEL_DIR" \
+  --output-dir "$OUTPUT_DIR" \
+  --suite libero_10 --task-ids 0 --episodes-per-task 1 \
+  --baseline learned --threshold-point conservative \
+  --decision-rule 4_of_5 --cooldown-queries 6 \
+  --enable-astra --astra-smoke-force-call \
+  --astra-model "$ASTRA_MODEL" \
+  --astra-reasoning-effort "$ASTRA_REASONING_EFFORT" \
+  --astra-max-decisions 25 --astra-max-execution-chunks 25 \
+  --astra-max-tool-calls 100 --astra-max-wall-seconds 300 \
+  --max-steps 520 --episode-horizon 1000 \
+  --replan-steps 5 --gpu-index 0 --reset-retries 12
 ```
 
-## Diagnostics
+For the previously configured LIBERO-10 Task 8 experiment, explicitly use `--task-ids 8` and `--episode-horizon 1300`. `--max-steps` is the π0.5 phase limit; the episode horizon remains a separate hard cap. On an approved recovery return, only the π0.5 phase counter resets to zero—the episode-wide environment step count does not. If a later π0.5 phase exhausts its budget, the runner can initiate the configured Astra takeover path.
 
-Scripts in `scripts/diagnostics/` probe provider connectivity/tool schemas or audit LIBERO action mapping. They do not replace a full benchmark run. The action-protocol audit requires the configured external LIBERO/OpenPI environment.
+## Action-protocol diagnostic
 
-## Limitations and distribution
+The diagnostic uses the same production `LiberoEefAdapter` as the live Astra executor. It does not move the robot unless `--motion` is supplied; that option executes small signed motions in a fresh simulator episode.
 
-This is an extracted research integration. Training artifacts, external datasets, simulator assets, and environment setup are maintained separately. A project license has not yet been selected; add a `LICENSE` file before distributing this repository as open-source software. Also verify third-party asset and dependency licenses before redistribution.
+```bash
+python scripts/audit_libero_action_protocol.py \
+  --openpi-root "$OPENPI_ROOT" --gpu-index 0 \
+  --task-id 0 --output "$OUTPUT_DIR/action_audit.json"
+```
+
+Add `--motion` only when a bounded simulated motion check is intended.
+
+## Repository contents
+
+- `models/`: CALL decision/control, handoff contracts, checkpoint metadata, Astra protocol/executor, provider transport, and LIBERO adapter.
+- `scripts/run_call_astra_v1_closed_loop.py`: episode/task runner.
+- `scripts/audit_libero_action_protocol.py`: production-adapter audit.
+- `scripts/probe_astra_*.py`: no-robot provider/transport diagnostics; require separately configured credentials only when used.
+
+The old lab-specific multi-suite shell pipeline is intentionally not included: it embedded machine-specific paths and depended on reporting/training tools outside this deployment runtime.

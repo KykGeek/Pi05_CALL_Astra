@@ -44,6 +44,7 @@ class QueryOutcome:
                 "threshold": self.decision.threshold,
                 "hard_threshold": self.decision.hard_threshold,
                 "decision_rule": self.decision.decision_rule,
+                "min_steps_suppressed": self.decision.min_steps_suppressed,
                 "reason": self.decision.reason,
                 "recent_scores": list(self.decision.recent_scores),
                 "recovery_status": (
@@ -81,8 +82,8 @@ class CallController:
     action object returned by π0.5 is passed through. On CALL_ASTRA the planned
     chunk is recorded in the handoff request but is never returned for execution.
     In shadow mode, CALL_ASTRA is recorded by the caller but the action chunk is
-    returned so the episode can continue to its natural outcome. Multiple live
-    handoffs are allowed after a host-enforced minimum step interval.
+    returned so the episode can continue to its natural outcome.
+    The controller refuses any later inference until an episode reset.
     """
 
     def __init__(
@@ -96,8 +97,10 @@ class CallController:
         decision_engine: DecisionEngine,
         shadow_mode: bool = False,
         reentry_gate: RecoveryReentryGate | None = None,
-        min_steps_between_calls: int = 20,
+        min_steps_between_calls: int = 0,
     ) -> None:
+        if int(min_steps_between_calls) < 0:
+            raise ValueError("min_steps_between_calls must be nonnegative")
         self.episode_id = str(episode_id)
         self.suite = str(suite)
         self.policy_infer = policy_infer
@@ -105,13 +108,11 @@ class CallController:
         self.handoff_handler = handoff_handler
         self.decision_engine = decision_engine
         self.shadow_mode = bool(shadow_mode)
-        self.reentry_gate = reentry_gate or RecoveryReentryGate()
-        if int(min_steps_between_calls) < 0:
-            raise ValueError("min_steps_between_calls must be nonnegative")
         self.min_steps_between_calls = int(min_steps_between_calls)
+        self.reentry_gate = reentry_gate or RecoveryReentryGate()
         self.state = ControllerState.VLA_RUN
         self._handoff_attempted = False
-        self._last_handoff_step: int | None = None
+        self._last_resume_step: int | None = None
         self._last_decision: CallDecision | None = None
         self._last_policy_result: Mapping[str, Any] | None = None
         self._recovery_outcome: RecoveryOutcome | None = None
@@ -151,6 +152,18 @@ class CallController:
         action_chunk = policy_result["actions"]
         p_help = float(self.score_help(policy_result))
         decision = self.decision_engine.evaluate(p_help)
+        if (
+            decision.decision == "CALL_ASTRA"
+            and decision.reason != "hard_threshold"
+            and self._last_resume_step is not None
+            and int(env_step) - self._last_resume_step < self.min_steps_between_calls
+        ):
+            decision = replace(
+                decision,
+                decision="CONTINUE",
+                reason="min_pi05_steps_between_astra_calls",
+                min_steps_suppressed=True,
+            )
         self._last_decision = decision
         if decision.decision == "CONTINUE":
             return QueryOutcome(
@@ -166,27 +179,22 @@ class CallController:
                 actions_to_execute=action_chunk,
             )
 
-        if (
-            self._last_handoff_step is not None
-            and int(env_step) - self._last_handoff_step < self.min_steps_between_calls
-        ):
-            remaining = self.min_steps_between_calls - (int(env_step) - self._last_handoff_step)
-            decision = replace(
-                decision,
-                decision="CONTINUE",
-                reason="call_interval_active",
-                cooldown_remaining=max(0, int(remaining)),
-                cooldown_suppressed=True,
-            )
-            self._last_decision = decision
+        if self._handoff_attempted:
+            self.state = ControllerState.HANDOFF
             return QueryOutcome(
-                state=ControllerState.VLA_RUN,
+                state=ControllerState.HANDOFF,
                 decision=decision,
-                actions_to_execute=action_chunk,
+                actions_to_execute=None,
+                handoff_response=HandoffResponse(
+                    status="handoff_limit_reached",
+                    detail=(
+                        "a CALL_ASTRA was requested while an earlier intervention "
+                        "had not safely returned control"
+                    ),
+                ),
             )
         self.state = ControllerState.CALL_PENDING
         self._handoff_attempted = True
-        self._last_handoff_step = int(env_step)
         request = HandoffRequest(
             task_instruction=str(task_instruction),
             episode_id=self.episode_id,
@@ -313,9 +321,23 @@ class CallController:
                 decision=decision,
                 actions_to_execute=action_chunk,
             )
+        if self._handoff_attempted:
+            self.state = ControllerState.HANDOFF
+            return QueryOutcome(
+                state=ControllerState.HANDOFF,
+                decision=decision,
+                actions_to_execute=None,
+                handoff_response=HandoffResponse(
+                    status="handoff_limit_reached",
+                    detail=(
+                        "a CALL_ASTRA was requested while an earlier intervention "
+                        "had not safely returned control"
+                    ),
+                ),
+            )
+
         self.state = ControllerState.CALL_PENDING
         self._handoff_attempted = True
-        self._last_handoff_step = int(env_step)
         request = HandoffRequest(
             task_instruction=str(task_instruction),
             episode_id=self.episode_id,
@@ -360,6 +382,11 @@ class CallController:
             )
         if self._reentry_decision is None or not self._reentry_decision.allowed:
             raise RuntimeError("recovery re-entry was not approved")
+        self._last_resume_step = int(self._reentry_decision.resume_step)
+        # A later CALL is permitted only after the prior intervention has
+        # explicitly returned a validated checkpoint. Learned CALLs are gated
+        # by min_steps_between_calls; forced episode-boundary calls are not.
+        self._handoff_attempted = False
         self.decision_engine.reset()
         self.state = ControllerState.VLA_RUN
         return self._reentry_decision
@@ -379,7 +406,7 @@ class CallController:
             self.suite = str(suite)
         self.decision_engine.reset()
         self._handoff_attempted = False
-        self._last_handoff_step = None
+        self._last_resume_step = None
         self._last_decision = None
         self._last_policy_result = None
         self._recovery_outcome = None

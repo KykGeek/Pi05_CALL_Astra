@@ -1,7 +1,7 @@
-"""Short-lived loopback relay for diagnosing custom Responses transports.
+"""Short-lived loopback relay for the configured HTTPS Responses provider.
 
 The relay is intentionally narrow: it binds only to loopback, accepts only the
-Responses endpoint, forwards to the approved provider over verified HTTPS, and
+Responses endpoint, forwards to the configured provider over HTTPS, and
 records schema/status metadata rather than request or response content.
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import re
 import threading
-from typing import Any, Mapping, Optional
+from typing import Any, Optional
 from urllib.parse import urlsplit
 
 import requests
@@ -26,16 +26,17 @@ _HOP_BY_HOP = {
 
 
 class LocalResponsesProxy:
-    """Loopback-only byte relay to api.zhizengzeng.com/v1/responses."""
+    """Loopback-only byte relay to one configured provider's /v1 API."""
 
     def __init__(self, upstream_base_url: str, *, allowed_tool_names: Optional[list[str]] = None,
                  read_timeout: float = 360.0) -> None:
         parsed = urlsplit(str(upstream_base_url).rstrip("/"))
-        if (parsed.scheme != "https" or parsed.hostname != "api.zhizengzeng.com" or
+        if (parsed.scheme != "https" or not parsed.hostname or
                 parsed.username or parsed.password or parsed.query or parsed.fragment or
                 parsed.port not in (None, 443) or parsed.path.rstrip("/") != "/v1"):
             raise ValueError("astra_provider_base_url_invalid")
-        self.upstream_url = "https://api.zhizengzeng.com/v1/responses"
+        self.upstream_base_url = "https://" + parsed.netloc + "/v1"
+        self.upstream_url = self.upstream_base_url + "/responses"
         self.allowed_tool_names = frozenset(
             name for name in (allowed_tool_names or [])
             if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name)
@@ -49,7 +50,6 @@ class LocalResponsesProxy:
         self._provider_failures: Counter[str] = Counter()
         self._request_image_items = 0
         self._request_tool_counts: Counter[str] = Counter()
-        self._usage: Counter[str] = Counter()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -77,7 +77,7 @@ class LocalResponsesProxy:
                     with requests.Session() as session:
                         session.trust_env = False
                         with session.get(
-                            "https://api.zhizengzeng.com/v1/models", headers=headers,
+                            owner.upstream_base_url + "/models", headers=headers,
                             timeout=(15.0, 45.0), allow_redirects=False,
                         ) as upstream:
                             payload = upstream.content
@@ -205,25 +205,6 @@ class LocalResponsesProxy:
                 self._event_types[kind] += 1
         if kind == "response.failed":
             self._record_error_payload(payload)
-        if kind == "response.completed":
-            response = event.get("response")
-            usage = response.get("usage") if isinstance(response, dict) else None
-            if isinstance(usage, dict):
-                self._record_usage(usage)
-
-    def _record_usage(self, usage: Mapping[str, Any]) -> None:
-        def add(name: str, value: Any) -> None:
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                self._usage[name] += int(value)
-        add("input_tokens", usage.get("input_tokens"))
-        add("output_tokens", usage.get("output_tokens"))
-        add("total_tokens", usage.get("total_tokens"))
-        input_details = usage.get("input_tokens_details")
-        output_details = usage.get("output_tokens_details")
-        if isinstance(input_details, dict):
-            add("cached_input_tokens", input_details.get("cached_tokens"))
-        if isinstance(output_details, dict):
-            add("reasoning_tokens", output_details.get("reasoning_tokens"))
 
     def _record_request_body(self, body: bytes) -> None:
         try:
@@ -296,12 +277,9 @@ class LocalResponsesProxy:
                 "model_catalog_reads": self._model_catalog_reads,
                 "upstream_statuses": dict(self._upstream_statuses),
                 "event_types": dict(self._event_types),
-                "provider_failures": dict(self._provider_failures) or None,
+                "provider_failures": dict(self._provider_failures),
                 "input_image_items": self._request_image_items,
                 "tool_names_seen": sorted(self._request_tool_counts),
-                "usage": dict(self._usage) or None,
-                "cost_estimate_usd": None,
-                "cost_estimate_note": "provider pricing was not exposed by the Responses usage payload",
             }
 
     def close(self) -> None:

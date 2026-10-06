@@ -1,4 +1,4 @@
-"""Bounded Codex app-server client for Astra's episode-scoped dynamic tools."""
+"""Bounded JSON-RPC client for episode-scoped dynamic tools."""
 from __future__ import annotations
 
 import json
@@ -10,7 +10,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Mapping, Optional
@@ -19,47 +18,11 @@ from urllib.parse import urlsplit
 from .provider_proxy import LocalResponsesProxy
 
 
-DEFAULT_MODEL_PROVIDER = "zhizengzeng"
-DEFAULT_BASE_URL = "https://api.zhizengzeng.com/v1"
-API_KEY_ENVIRONMENT_VARIABLE = "API_SECRET_KEY"
-DEFAULT_ASTRA_MODEL = os.environ.get("ASTRA_MODEL", "gpt-6-luna")
+DEFAULT_MODEL_PROVIDER = os.environ.get("ASTRA_CODEX_PROVIDER", "custom")
+DEFAULT_BASE_URL = os.environ.get("ASTRA_BASE_URL", "")
+API_KEY_ENVIRONMENT_VARIABLE = os.environ.get("ASTRA_API_KEY_ENV", "ASTRA_API_KEY")
+DEFAULT_ASTRA_MODEL = os.environ.get("ASTRA_MODEL", "gpt-6-astra")
 DEFAULT_REASONING_EFFORT = os.environ.get("ASTRA_REASONING_EFFORT", "medium")
-
-
-def _load_project_env() -> None:
-    """Load the nearest project .env without overwriting explicit env vars."""
-    roots: list[Path] = [Path(__file__).resolve().parents[2]]
-    for candidate in (Path.cwd(),):
-        roots.extend([candidate, *candidate.parents])
-    seen: set[Path] = set()
-    for root in roots:
-        env_path = root / ".env"
-        if env_path in seen or not env_path.is_file():
-            continue
-        seen.add(env_path)
-        try:
-            lines = env_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
-        for raw in lines:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[7:].lstrip()
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            # Preserve an explicit non-empty process value, but allow the
-            # project .env to repair variables exported as empty strings.
-            if not key or (key in os.environ and os.environ[key].strip()):
-                continue
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-                value = value[1:-1]
-            os.environ[key] = value
-        return
 
 
 class CodexClientError(RuntimeError):
@@ -82,10 +45,12 @@ class CodexAppServerClient:
         self.model = str(model)
         self.effort = str(effort)
         self.model_provider = os.environ.get("ASTRA_CODEX_PROVIDER", DEFAULT_MODEL_PROVIDER)
-        self.base_url = (base_url or os.environ.get("BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
+        self.base_url = (base_url or os.environ.get("ASTRA_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
         self.allow_loopback_http = bool(allow_loopback_http)
         self.use_provider_relay = bool(use_provider_relay)
-        self.api_key_environment_variable = API_KEY_ENVIRONMENT_VARIABLE
+        self.api_key_environment_variable = os.environ.get(
+            "ASTRA_API_KEY_ENV", API_KEY_ENVIRONMENT_VARIABLE
+        ).strip()
         self.developer_instructions = str(developer_instructions)
         self.dynamic_tools = dynamic_tools
         self.max_wall_seconds = float(max_wall_seconds)
@@ -103,85 +68,20 @@ class CodexAppServerClient:
         self._model_response_received = False
         self.cli_version = "unknown"
         self.thread_id: Optional[str] = None
-        self._trace_enabled = os.environ.get("ASTRA_PROMPT_TRACE", "1").strip().lower() not in {
-            "0", "false", "no", "off"
-        }
-        self._trace_path = self.workspace / "astra_prompt_trace.jsonl"
-        self._trace_turn_index = 0
-        self._trace_event_index = 0
 
     @property
     def model_response_received(self) -> bool:
         return self._model_response_received
 
-    @staticmethod
-    def _trace_estimated_tokens(value: Any) -> int:
-        """Diagnostic estimate only; provider usage is recorded separately when available."""
-        try:
-            raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-        except Exception:
-            raw = str(value)
-        return max(1, (len(raw) + 3) // 4)
-
-    @staticmethod
-    def _trace_sanitize_content_items(items: Any) -> list[Any]:
-        """Keep text/state but omit camera base64 from the diagnostic trace."""
-        sanitized: list[Any] = []
-        if not isinstance(items, list):
-            return sanitized
-        for item in items:
-            if not isinstance(item, Mapping):
-                sanitized.append(item)
-                continue
-            item_type = item.get("type")
-            if item_type in {"inputImage", "image", "input_image"}:
-                entry: dict[str, Any] = {"type": item_type, "image_omitted": True}
-                for key in ("width", "height", "mimeType", "mediaType", "detail"):
-                    if key in item:
-                        entry[key] = item[key]
-                sanitized.append(entry)
-            else:
-                sanitized.append(dict(item))
-        return sanitized
-
-    def _trace(self, event: str, **fields: Any) -> None:
-        if not self._trace_enabled:
-            return
-        self._trace_event_index += 1
-        payload = {"event_index": self._trace_event_index, "event": event,
-                   "time_unix": time.time(), **fields}
-        try:
-            self._trace_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._trace_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
-        except OSError:
-            return
-        if event in {"thread_start", "turn_input", "tool_result_input", "provider_usage"}:
-            summary = [f"[astra-trace] {event}"]
-            if "turn_index" in fields:
-                summary.append(f"turn={fields['turn_index']}")
-            if "estimated_tokens" in fields:
-                summary.append(f"estimated_tokens={fields['estimated_tokens']}")
-            if "usage" in fields:
-                summary.append(f"usage={fields['usage']}")
-            summary.append(f"file={self._trace_path}")
-            sys.stderr.write(" ".join(summary) + "\n")
-            sys.stderr.flush()
-
     def start(self) -> None:
         if self._proc is not None:
             raise RuntimeError("Codex_client_already_started")
-        _load_project_env()
-        self._trace(
-            "startup_config",
-            module_file=str(Path(__file__).resolve()),
-            cwd=str(Path.cwd()),
-            api_key_present=bool(os.environ.get(self.api_key_environment_variable, "").strip()),
-            project_env=str(Path(__file__).resolve().parents[2] / ".env"),
-            project_env_exists=(Path(__file__).resolve().parents[2] / ".env").is_file(),
-        )
-        if not os.environ.get(self.api_key_environment_variable, "").strip():
+        if not self.api_key_environment_variable or not os.environ.get(
+            self.api_key_environment_variable, ""
+        ).strip():
             raise CodexClientError("astra_provider_api_key_missing")
+        if not self.base_url:
+            raise CodexClientError("astra_provider_base_url_missing")
         if not _valid_provider_url(self.base_url, allow_loopback_http=self.allow_loopback_http):
             raise CodexClientError("astra_provider_base_url_invalid")
         if not re.fullmatch(r"[A-Za-z0-9_-]+", self.model_provider):
@@ -234,21 +134,6 @@ class CodexAppServerClient:
             if self.cli_version == "unknown" and re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", server_version):
                 self.cli_version = server_version
             self._notify("initialized", {})
-            dynamic_tools_json = json.dumps(
-                self.dynamic_tools, ensure_ascii=False, separators=(",", ":"), default=str
-            )
-            self._trace(
-                "thread_start",
-                model=self.model,
-                reasoning_effort=self.effort,
-                developer_prompt=self.developer_instructions,
-                developer_chars=len(self.developer_instructions),
-                developer_estimated_tokens=self._trace_estimated_tokens(self.developer_instructions),
-                dynamic_tools=self.dynamic_tools,
-                dynamic_tools_chars=len(dynamic_tools_json),
-                dynamic_tools_estimated_tokens=self._trace_estimated_tokens(self.dynamic_tools),
-                trace_path=str(self._trace_path),
-            )
             thread = self._request("thread/start", {
                 "cwd": str(self.workspace),
                 "model": self.model,
@@ -289,9 +174,7 @@ class CodexAppServerClient:
         argv = [
             executable, "app-server", "--stdio", "--strict-config",
             "-c", 'default_permissions="' + profile + '"',
-            # The upstream multi_agent_v2 path can disconnect Responses
-            # streams for custom providers. Astra runs one isolated episode
-            # and never needs Codex subagents, so disable it explicitly.
+            # Disable subagents to keep each episode isolated.
             "-c", "features.multi_agent_v2.enabled=false",
             # The loopback relay sends only allowlisted dynamic tool schemas.
             "-c", "permissions." + profile + '.extends=":read-only"',
@@ -311,57 +194,14 @@ class CodexAppServerClient:
         return argv
 
     def run(self, initial_text: str, dispatch: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
-            *, idle_timeout_seconds: float = 240.0,
-            max_turns_without_terminal_tool: int = 1,
-            initial_input_items: Optional[list[Mapping[str, Any]]] = None) -> Dict[str, Any]:
+            *, idle_timeout_seconds: float = 120.0,
+            max_turns_without_terminal_tool: int = 1) -> Dict[str, Any]:
         if self._proc is None or self.thread_id is None:
             raise CodexClientError("codex_client_not_started")
         absolute_deadline = time.monotonic() + self.max_wall_seconds
         turns = 0
         tool_calls = 0
-        # A Responses turn may contain more than one function call.  That is
-        # harmless for read-only calls, but it is unsafe for LIBERO actions:
-        # the first execute advances the simulator and invalidates every
-        # action that was planned in the same model turn.  Keep the turn alive
-        # so the model can finish, but never dispatch a second action from it.
-        action_tools = {
-            "libero_execute_eef",
-            "libero_execute_eef_chunk",
-            "libero_edit_pi05_chunk",
-            "libero_resume_pi05",
-            "libero_stop",
-        }
-        refresh_tools = {"libero_observe", "pi05_propose"}
-        # Only a duplicate action after an accepted action is a hard protocol
-        # violation. Stale IDs and sequencing mistakes are recoverable: the
-        # executor returns no_execution feedback so Astra can correct the call.
-        host_recovery_errors = {
-        }
-        action_seen_this_turn = False
-        refresh_turn_after_action = False
-        host_proposal_pending = False
-        restart_after_rejection = False
-        recovery_rejection_seen_this_turn = False
-        active_turn_id = None
-        interrupt_sent_this_turn = False
-        next_turn_input: Optional[dict[str, Any]] = None
-
-        def interrupt_active_turn() -> None:
-            nonlocal interrupt_sent_this_turn
-            if interrupt_sent_this_turn or not self.thread_id or not active_turn_id:
-                return
-            try:
-                self._request(
-                    "turn/interrupt",
-                    {"threadId": self.thread_id, "turnId": str(active_turn_id)},
-                    timeout=10.0,
-                )
-            except CodexClientError:
-                # The normal host rejection remains authoritative even if an
-                # older app-server does not expose turn/interrupt.
-                pass
-            interrupt_sent_this_turn = True
-        self._start_turn(initial_text, input_items=initial_input_items)
+        self._start_turn(initial_text)
         turns += 1
         while time.monotonic() < absolute_deadline:
             timeout = min(float(idle_timeout_seconds), absolute_deadline - time.monotonic())
@@ -371,14 +211,7 @@ class CodexAppServerClient:
                 raise CodexClientError("model_idle_timeout",
                                        model_response_received=self._model_response_received) from error
             method = event.get("method") if isinstance(event, Mapping) else None
-            if method == "turn/started":
-                params = event.get("params") or {}
-                turn = params.get("turn") if isinstance(params, Mapping) else None
-                if isinstance(turn, Mapping):
-                    active_turn_id = turn.get("id") or turn.get("turnId")
-                if active_turn_id is None and isinstance(params, Mapping):
-                    active_turn_id = params.get("turnId")
-            elif method == "item/tool/call":
+            if method == "item/tool/call":
                 self._model_response_received = True
                 tool_calls += 1
                 params = event.get("params") or {}
@@ -396,87 +229,14 @@ class CodexAppServerClient:
                     self._reply(event.get("id"), result)
                     continue
                 try:
-                    if recovery_rejection_seen_this_turn:
-                        # Once the host rejects a protocol call, do not let
-                        # the model spend the remaining Responses turn on
-                        # more invalid calls.  The host will restart a fresh
-                        # turn after the current response is closed.
-                        result_data = {
-                            "error": "host_recovery_pending",
-                            "retryable": True,
-                            "no_execution": True,
-                            "instruction": (
-                                "The host rejected a protocol call in this Responses turn. "
-                                "Do not make any more tool calls in this turn; the host will "
-                                "start a fresh turn with the current state."
-                            ),
-                        }
-                    elif name in action_tools and action_seen_this_turn:
-                        # Do not let a second action from the same Responses
-                        # turn reach the environment.  The first action has
-                        # already advanced the simulator; a new decision must
-                        # be made in a fresh turn from the host-refreshed
-                        # observation/proposal.
-                        result_data = {
-                            "error": "stale_action_same_responses_turn",
-                            "retryable": True,
-                            "no_execution": True,
-                            "instruction": (
-                                "The previous action already executed and advanced the simulator. "
-                                "This duplicate call was not executed again. Call libero_observe now, then pi05_propose, "
-                                "and use the newest IDs before choosing chunk edit, execute, or resume."
-                            ),
-                        }
-                    elif name in refresh_tools and host_proposal_pending:
-                        # The host already performed observe -> pi05_propose
-                        # after the previous execute.  Do not let the model
-                        # create a second, stale refresh chain.
-                        result_data = {
-                            "error": "fresh_pi05_proposal_already_available",
-                            "retryable": True,
-                            "no_execution": True,
-                            "instruction": (
-                                "The previous action already executed. This duplicate refresh call "
-                                "was not applied. Call libero_observe now, then pi05_propose, and "
-                                "use the newest IDs before choosing chunk edit, execute, or resume."
-                            ),
-                        }
-                    else:
-                        result_data = dispatch(name, args)
-                        if name == "libero_observe" and not bool(result_data.get("no_execution", False)):
-                            # A fresh observation starts the next decision
-                            # segment of the same recovery cycle.  The next
-                            # execute/resume is therefore legal in this turn.
-                            action_seen_this_turn = False
-                        if name in action_tools and not bool(result_data.get("no_execution", False)):
-                            # A recoverable validation error is feedback, not
-                            # an executed action.  Keep the Responses turn
-                            # alive so Astra can correct the arguments and
-                            # retry.  Only a real environment action locks
-                            # the action slot for this turn.
-                            action_seen_this_turn = True
-                            if name in {"libero_resume_pi05", "libero_stop"}:
-                                host_proposal_pending = False
-                    if str(result_data.get("error", "")) in host_recovery_errors:
-                        restart_after_rejection = True
-                        recovery_rejection_seen_this_turn = True
-                        interrupt_active_turn()
+                    result_data = dispatch(name, args)
                     terminal = bool(result_data.get("_terminal", False))
-                    candidate_next_turn = result_data.get("_next_turn_input")
-                    if isinstance(candidate_next_turn, Mapping):
-                        next_turn_input = dict(candidate_next_turn)
-                        refresh_turn_after_action = True
                     packet = dict(result_data)
                     packet.pop("_terminal", None)
-                    packet.pop("_next_turn_input", None)
                     result = {"success": True, "contentItems": _content_items(packet)}
                 except Exception as error:
                     code = getattr(error, "code", None) or getattr(error, "args", ["tool_rejected"])[0]
                     safe_code = _safe_code(code)
-                    if safe_code in host_recovery_errors:
-                        restart_after_rejection = True
-                        recovery_rejection_seen_this_turn = True
-                        interrupt_active_turn()
                     result = {"success": False, "contentItems": [
                         {"type": "inputText", "text": json.dumps({"error": safe_code, "no_execution": True})}
                     ]}
@@ -488,58 +248,12 @@ class CodexAppServerClient:
                             "cli_version": self.cli_version}
             elif method == "turn/completed":
                 turns_completed = int(event.get("params", {}).get("turn", {}).get("id") is not None)
-                action_seen_this_turn = False
-                if restart_after_rejection:
-                    # A rejected stale/repeated call is recovered by the
-                    # host, not by asking Astra to remember the protocol.
-                    restart_after_rejection = False
-                    refresh_turn_after_action = False
-                    recovery_rejection_seen_this_turn = False
-                    interrupt_sent_this_turn = False
-                    self._start_turn(
-                        "The host rejected a stale or repeated tool call. The host owns the "
-                        "recovery: use the newest host-refreshed observation and pi05 proposal, "
-                        "then make exactly one current legal action call. Do not repeat the "
-                        "rejected call and do not call observe or pi05_propose again unless the "
-                        "host explicitly provides a new turn requiring it."
-                    )
-                elif refresh_turn_after_action:
-                    turn_input = next_turn_input or {
-                        "text": (
-                            "The host refreshed the simulator state. Use the newest host "
-                            "context and make exactly one current action call."
-                        )
-                    }
-                    refresh_turn_after_action = False
-                    next_turn_input = None
-                    recovery_rejection_seen_this_turn = False
-                    interrupt_sent_this_turn = False
-                    self._start_turn(
-                        str(turn_input.get("text", "Use the newest host context and make one action call.")),
-                        input_items=turn_input.get("input_items"),
-                    )
-                else:
-                    if turns >= 1 + max_turns_without_terminal_tool:
-                        raise CodexClientError("model_completed_without_terminal_tool",
-                                               model_response_received=self._model_response_received)
-                    self._start_turn("Continue this same recovery. Use the latest tool observation, request and proposal IDs. Do not repeat completed actions. Make one next tool call.")
-                    recovery_rejection_seen_this_turn = False
-                    interrupt_sent_this_turn = False
+                if turns >= 1 + max_turns_without_terminal_tool:
+                    raise CodexClientError("model_completed_without_terminal_tool",
+                                           model_response_received=self._model_response_received)
+                self._start_turn("Continue this same recovery. Use the latest tool observation, request and proposal IDs. Do not repeat completed actions. Make one next tool call.")
                 turns += 1
             elif method in ("turn/failed", "error"):
-                if method == "turn/failed" and restart_after_rejection:
-                    restart_after_rejection = False
-                    action_seen_this_turn = False
-                    refresh_turn_after_action = False
-                    recovery_rejection_seen_this_turn = False
-                    interrupt_sent_this_turn = False
-                    self._start_turn(
-                        "The previous Astra turn ended after a host-rejected stale or repeated "
-                        "call. Start a new decision turn from the host's latest state and make "
-                        "one current legal action call."
-                    )
-                    turns += 1
-                    continue
                 failure_code = _turn_failure_code(event) or _turn_failure_shape(event)
                 suffix = "_" + failure_code if failure_code else ""
                 raise CodexClientError("codex_turn_failed" + suffix,
@@ -547,42 +261,14 @@ class CodexAppServerClient:
         raise CodexClientError("intervention_wall_timeout",
                                model_response_received=self._model_response_received)
 
-    def _start_turn(self, text: str,
-                    *, input_items: Optional[list[Mapping[str, Any]]] = None) -> None:
-        self._trace_turn_index += 1
-        self._trace(
-            "turn_input",
-            turn_index=self._trace_turn_index,
-            text=text,
-            chars=len(text),
-            estimated_tokens=self._trace_estimated_tokens(text),
-        )
-        # The app-server `turn/start` protocol expects a normal text input
-        # item.  `_content_items()` is the Responses-side representation
-        # (`inputText`/`inputImage`) and must not replace that text item.  Keep
-        # the host context in the text field and append only image attachments
-        # that the app-server accepts.  Passing `inputText` as the whole input
-        # made the model receive an empty/invalid turn, so it completed without
-        # emitting an action tool call.
-        turn_input = [{"type": "text", "text": str(text)}]
-        for item in input_items or []:
-            if not isinstance(item, Mapping):
-                continue
-            if item.get("type") == "inputImage":
-                # Dynamic-tool results use `inputImage/imageUrl`, while a
-                # `turn/start` request uses the UserInput union:
-                # `image/url`.  Passing the dynamic-tool shape here yields
-                # app-server JSON-RPC -32600 on the next host-driven turn.
-                image_url = item.get("imageUrl")
-                if isinstance(image_url, str) and image_url.startswith("data:image/"):
-                    turn_input.append({"type": "image", "url": image_url})
+    def _start_turn(self, text: str) -> None:
         self._request("turn/start", {
             "threadId": self.thread_id,
             "model": self.model,
             "effort": self.effort,
             "approvalPolicy": "never",
             "cwd": str(self.workspace),
-            "input": turn_input,
+            "input": [{"type": "text", "text": str(text)}],
         }, timeout=45.0)
 
     def _request(self, method: str, params: Mapping[str, Any], timeout: float) -> Any:
@@ -620,15 +306,6 @@ class CodexAppServerClient:
         proc = self._proc
         if proc is None or proc.stdin is None or ident is None:
             raise CodexClientError("codex_tool_reply_missing_id")
-        trace_items = self._trace_sanitize_content_items(result.get("contentItems"))
-        self._trace(
-            "tool_result_input",
-            turn_index=self._trace_turn_index,
-            request_id=ident,
-            content_items=trace_items,
-            chars=len(json.dumps(trace_items, ensure_ascii=False, separators=(",", ":"), default=str)),
-            estimated_tokens=self._trace_estimated_tokens(trace_items),
-        )
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": ident,
                                     "result": result}) + "\n")
         proc.stdin.flush()
@@ -657,9 +334,6 @@ class CodexAppServerClient:
                 continue
             if not isinstance(message, Mapping):
                 continue
-            usage = message.get("usage")
-            if isinstance(usage, Mapping):
-                self._trace("provider_usage", usage=dict(usage))
             ident = message.get("id")
             if ident is not None and "method" not in message:
                 with self._lock:
@@ -741,7 +415,7 @@ def _valid_provider_url(value: str, *, allow_loopback_http: bool = False) -> boo
                       parsed.path.rstrip("/") != "/v1")
     if common_invalid:
         return False
-    if parsed.scheme == "https" and parsed.hostname == "api.zhizengzeng.com":
+    if parsed.scheme == "https" and parsed.hostname:
         return parsed.port in (None, 443)
     if not allow_loopback_http or parsed.scheme != "http" or parsed.port is None:
         return False
@@ -774,7 +448,7 @@ def _safe_code(value: Any) -> str:
 
 
 def _turn_failure_code(event: Mapping[str, Any]) -> Optional[str]:
-    """Extract only a short machine code from a failed Codex turn.
+    """Extract only a short machine code from a failed turn.
 
     Provider messages and stderr may contain credentials or request details;
     they are deliberately discarded and never written to the episode audit.
@@ -787,7 +461,7 @@ def _turn_failure_code(event: Mapping[str, Any]) -> Optional[str]:
         if isinstance(turn, Mapping):
             candidates.append(turn.get("error"))
     # Some app-server/provider failures wrap the useful machine status one or
-    # two levels below `error` (for example in codexErrorInfo). Traverse only
+    # two levels below `error`. Traverse only
     # known error containers and only read a fixed set of machine-code fields;
     # never inspect or persist free-form messages.
     queue = [(item, 0) for item in candidates]

@@ -155,15 +155,12 @@ class LoggingHandoffHandler:
     def on_call(self, request: HandoffRequest) -> HandoffResponse:
         _validate_complete_snapshot(request)
         self.snapshot_root.mkdir(parents=True, exist_ok=True)
-        base_call_name = _safe_name(
+        call_name = _safe_name(
             f"{request.suite}_{request.episode_id}_q{request.policy_query_idx:05d}"
         )
-        call_name = base_call_name
-        collision_index = 0
-        while (self.snapshot_root / call_name).exists():
-            collision_index += 1
-            call_name = f"{base_call_name}__handoff{collision_index + 1:02d}"
         destination = self.snapshot_root / call_name
+        if destination.exists():
+            raise FileExistsError(f"CALL snapshot already exists: {destination}")
 
         arrays: dict[str, np.ndarray] = {}
         _collect_arrays("observation", request.observation, arrays)
@@ -198,8 +195,6 @@ class LoggingHandoffHandler:
             "simulator_state_included": request.simulator_state is not None,
             "recovery_executed": False,
             "astra_called": False,
-            "snapshot_name": call_name,
-            "snapshot_collision_index": collision_index,
         }
 
         temporary = Path(

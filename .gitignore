@@ -1,23 +1,38 @@
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.idea/
-.venv/
-venv/
-
-# Local configuration and credentials
+# Credentials and local configuration
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+credentials*
 
-# Evaluation outputs and large media/checkpoints
-artifacts/
-outputs/
-reports/
-logs/
-videos/
-*.mp4
+# Python environments and generated caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# External weights, datasets, and run products
 *.pt
 *.pth
+*.ckpt
+*.safetensors
+*.parquet
+*.mp4
+*.avi
 *.npz
+*.jsonl
+results/
+runs/
+reports/
+outputs/
+videos/
+logs/
+
+# Local Codex/provider state
+.codex/
+codex_home/
+

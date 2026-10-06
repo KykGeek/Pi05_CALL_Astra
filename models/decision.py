@@ -21,6 +21,7 @@ class CallDecision:
     decision_rule: str
     cooldown_remaining: int = 0
     cooldown_suppressed: bool = False
+    min_steps_suppressed: bool = False
 
 
 class DecisionEngine(Protocol):

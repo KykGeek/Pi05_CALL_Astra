@@ -116,3 +116,4 @@ def install_feature_hook() -> None:
 
     if not hasattr(_pi0.Pi0, "sample_actions_with_features"):
         setattr(_pi0.Pi0, "sample_actions_with_features", sample_actions_with_features)
+
