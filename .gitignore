@@ -32,6 +32,9 @@ outputs/
 videos/
 logs/
 
+# Vetted public website videos are release assets, not raw experiment outputs.
+!docs/assets/*.mp4
+
 # Local Codex/provider state
 .codex/
 codex_home/

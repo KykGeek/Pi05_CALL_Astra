@@ -1,5 +1,9 @@
 # π0.5 + CALL + Astra for LIBERO
 
+[Project website, paper, and interactive episode demos](https://kykgeek.github.io/Pi05_CALL_Astra/)
+
+The website is served from `docs/` by GitHub Pages. See [website deployment notes](WEBSITE.md) for maintenance and release verification.
+
 Research runtime for a LIBERO episode controlled by π0.5, with a learned CALL head and an optional Astra recovery controller. The runtime includes the verified handoff/re-entry gate, the LIBERO EEF adapter, bounded Astra execution, and episode logging.
 
 ## Scope
